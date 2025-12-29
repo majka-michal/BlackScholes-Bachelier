@@ -1,0 +1,188 @@
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+import yfinance as yf
+from scipy.stats import norm
+from datetime import datetime
+
+# Ustawienia wykresów
+plt.style.use('seaborn-v0_8-darkgrid')
+
+#  KLASY MODELI 
+
+class OptionModel:
+    def __init__(self, S, K, T, r, option_type='call'):
+        self.S = S; self.K = K; self.T = T; self.r = r
+        self.sign = 1 if option_type.lower() == 'call' else -1
+
+class BlackScholes(OptionModel):
+    def price(self, sigma):
+        # Zabezpieczenie przed dzieleniem przez zero
+        if sigma <= 1e-6: return np.maximum(self.sign * (self.S - self.K), 0)
+        
+        d1 = (np.log(self.S / self.K) + (self.r + 0.5 * sigma ** 2) * self.T) / (sigma * np.sqrt(self.T))
+        d2 = d1 - sigma * np.sqrt(self.T)
+        
+        if self.sign == 1: # Call
+            return self.S * norm.cdf(d1) - self.K * np.exp(-self.r * self.T) * norm.cdf(d2)
+        else: # Put
+            return self.K * np.exp(-self.r * self.T) * norm.cdf(-d2) - self.S * norm.cdf(-d1)
+
+class Bachelier(OptionModel):
+    def price(self, sigma_abs):
+        # Sigma tutaj to zmienność absolutna (w dolarach), nie procentowa!
+        d = (self.S - self.K) / (sigma_abs * np.sqrt(self.T))
+        df = np.exp(-self.r * self.T)
+        
+        term1 = (self.S - self.K) * norm.cdf(self.sign * d)
+        term2 = sigma_abs * np.sqrt(self.T) * norm.pdf(d)
+        return df * (self.sign * term1 + term2)
+
+# --- FUNKCJE POMOCNICZE (ETL - Extract, Transform, Load) ---
+
+def get_real_data(ticker_symbol):
+    """
+    Pobiera dane rynkowe i łańcuch opcji dla danego tickera.
+    """
+    print(f"--> Fetching data for {ticker_symbol}...")
+    stock = yf.Ticker(ticker_symbol)
+    
+    # 1. Pobierz aktualną cenę (Spot Price)
+    try:
+        # Próbujemy fast_info, a jak nie to history
+        S0 = stock.fast_info['last_price']
+    except:
+        hist = stock.history(period="1d")
+        if hist.empty:
+            print(f"Error: Could not fetch data for {ticker_symbol}")
+            return None, None, None
+        S0 = hist['Close'].iloc[-1]
+
+    # 2. Pobierz daty wygaśnięcia
+    exps = stock.options
+    if not exps:
+        print(f"No options data for {ticker_symbol}")
+        return None, None, None
+    
+    # Wybieramy datę wygaśnięcia (np. drugą z kolei, żeby T nie było za małe)
+    # Jeśli jest tylko jedna, bierzemy pierwszą
+    target_date = exps[1] if len(exps) > 1 else exps[0]
+    
+    # Oblicz czas do wygaśnięcia (T) w latach
+    expiration = datetime.strptime(target_date, "%Y-%m-%d")
+    today = datetime.now()
+    T = (expiration - today).days / 365.25
+    
+    if T <= 0: T = 0.001 # Zabezpieczenie
+
+    # 3. Pobierz łańcuch opcji (Call options)
+    opt_chain = stock.option_chain(target_date)
+    calls = opt_chain.calls
+    
+    # --- DATA CLEANING (Kluczowe dla "Real World Data") ---
+    # a) Obliczamy średnią cenę rynkową (Mid Price)
+    calls['Market_Price'] = (calls['bid'] + calls['ask']) / 2
+    
+    # b) Jeśli bid/ask jest 0 (brak płynności), bierzemy lastPrice
+    calls.loc[calls['Market_Price'] == 0, 'Market_Price'] = calls['lastPrice']
+    
+    # c) Filtrujemy opcje bez obrotu lub z błędnymi danymi
+    # Zostawiamy tylko te, które mają sensowny strike wokół ceny spot (+- 40%)
+    calls = calls[
+        (calls['strike'] > S0 * 0.6) & 
+        (calls['strike'] < S0 * 1.4) &
+        (calls['Market_Price'] > 0.01)
+    ].copy() # copy() zapobiega SettingWithCopyWarning
+    
+    return S0, T, calls
+
+# --- GŁÓWNA PĘTLA ANALIZY ---
+
+def run_portfolio_validation():
+    tickers = ['FTAI', 'EME', 'NOK']
+    risk_free_rate = 0.045  # Przyjmujemy ok. 4.5% (US Treasury yield)
+    
+    # Ustawienie wykresów: 1 wiersz dla każdej spółki
+    fig, axes = plt.subplots(len(tickers), 2, figsize=(14, 5 * len(tickers)))
+    if len(tickers) == 1: axes = [axes] # Obsługa przypadku jednej spółki
+    
+    for i, ticker in enumerate(tickers):
+        S0, T, df = get_real_data(ticker)
+        
+        if df is None or df.empty:
+            continue
+            
+        strikes = df['strike'].values
+        market_prices = df['Market_Price'].values
+        
+        # --- KALIBRACJA ---
+        # Znajdź opcję najbliższą "At The Money" (ATM)
+        atm_idx = (np.abs(strikes - S0)).argmin()
+        atm_price = market_prices[atm_idx]
+        atm_strike = strikes[atm_idx]
+        
+        # 1. Kalibrujemy Black-Scholes do opcji ATM, aby znaleźć "Implied Volatility"
+        # Używamy prostego solvera "brute-force" dla czytelności kodu (w prod użyłbyś brentq)
+        # Szukamy sigma, która minimalizuje różnicę ceny
+        def solve_iv_bs(target_price):
+            best_sig = 0.2
+            min_diff = float('inf')
+            for sig in np.linspace(0.01, 2.0, 100):
+                bs_tmp = BlackScholes(S0, atm_strike, T, risk_free_rate).price(sig)
+                diff = abs(bs_tmp - target_price)
+                if diff < min_diff:
+                    min_diff = diff
+                    best_sig = sig
+            return best_sig
+
+        implied_vol_atm = solve_iv_bs(atm_price)
+        
+        # --- MODELOWANIE ---
+        # Zakładamy "Flat Volatility" (stałą zmienność) dla całego zakresu,
+        # żeby pokazać jak modele mylą się w ogonach (tails).
+        
+        # Black-Scholes Engine
+        bs_model = BlackScholes(S0, strikes, T, risk_free_rate)
+        df['BS_Price'] = bs_model.price(implied_vol_atm)
+        
+        # Bachelier Engine
+        bach_model = Bachelier(S0, strikes, T, risk_free_rate)
+        # Przybliżenie zmienności dla Bacheliera: Sigma_Norm = Sigma_Log * Spot
+        sigma_bach = implied_vol_atm * S0
+        df['Bach_Price'] = bach_model.price(sigma_bach)
+        
+        # --- WIZUALIZACJA ---
+        ax_price = axes[i][0]
+        ax_err = axes[i][1]
+        
+        # Wykres 1: Ceny Opcji
+        ax_price.scatter(strikes, market_prices, c='black', s=15, label='Market Data (Real)', alpha=0.7)
+        ax_price.plot(strikes, df['BS_Price'], 'b-', label=f'Black-Scholes (IV={implied_vol_atm:.1%})')
+        ax_price.plot(strikes, df['Bach_Price'], 'r--', label='Bachelier')
+        ax_price.axvline(S0, color='gray', linestyle=':', label='Spot Price')
+        ax_price.set_title(f'{ticker}: Option Pricing (T={T:.2f} yrs)')
+        ax_price.set_xlabel('Strike')
+        ax_price.set_ylabel('Price ($)')
+        ax_price.legend()
+        
+        # Wykres 2: Pricing Error (Różnica Model vs Rynek)
+        # To pokazuje "Limitations" modelu
+        err_bs = df['BS_Price'] - market_prices
+        err_bach = df['Bach_Price'] - market_prices
+        
+        ax_err.plot(strikes, err_bs, 'b.-', label='BS Error')
+        ax_err.plot(strikes, err_bach, 'r.--', label='Bachelier Error')
+        ax_err.axhline(0, color='black', lw=1)
+        ax_err.set_title(f'{ticker}: Pricing Error (Model - Market)')
+        ax_err.set_xlabel('Strike')
+        ax_err.set_ylabel('Error ($)')
+        ax_err.legend()
+
+    plt.tight_layout()
+    plt.show()
+
+if __name__ == "__main__":
+    try:
+        run_portfolio_validation()
+    except Exception as e:
+        print(f"An error occurred: {e}")    
